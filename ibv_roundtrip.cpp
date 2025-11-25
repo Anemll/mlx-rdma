@@ -22,17 +22,16 @@
 
 namespace {
 
-constexpr std::size_t kMessageSize = 1000;
-constexpr std::size_t kBufferBytes = 4096;
-constexpr const char* kBuildVersion = "v0.0.23";
+constexpr std::size_t kDefaultMessageSize = 1000;
+constexpr std::size_t kMaxMessageSize = 65536;  // 64KB max
+constexpr const char* kBuildVersion = "v0.0.26";
 
-struct Message {
+struct MessageHeader {
   uint64_t sequence;
   uint64_t send_time_ns;
-  std::array<uint8_t, kMessageSize - 16> payload;
 };
 
-static_assert(sizeof(Message) == kMessageSize, "Message must be exactly 1000 bytes");
+constexpr std::size_t kHeaderSize = sizeof(MessageHeader);
 
 struct WireQPInfo {
   uint16_t lid;
@@ -50,6 +49,7 @@ struct Options {
   std::string connect_host;
   uint16_t connect_port = 0;
   int iterations = 16;
+  std::size_t message_size = kDefaultMessageSize;
 };
 
 void* allocate_page_aligned(size_t num_bytes) {
@@ -278,10 +278,10 @@ bool modify_qp_to_rts(ibv_qp* qp, uint32_t psn) {
   return true;
 }
 
-bool post_receive(ibv_qp* qp, void* buffer, ibv_mr* mr, uint64_t wr_id) {
+bool post_receive(ibv_qp* qp, void* buffer, ibv_mr* mr, uint64_t wr_id, std::size_t msg_size) {
   ibv_sge sg{};
   sg.addr = reinterpret_cast<uintptr_t>(buffer);
-  sg.length = sizeof(Message);
+  sg.length = static_cast<uint32_t>(msg_size);
   sg.lkey = mr->lkey;
 
   ibv_recv_wr wr{};
@@ -300,10 +300,10 @@ bool post_receive(ibv_qp* qp, void* buffer, ibv_mr* mr, uint64_t wr_id) {
   return true;
 }
 
-bool post_send(ibv_qp* qp, void* buffer, ibv_mr* mr, uint64_t wr_id) {
+bool post_send(ibv_qp* qp, void* buffer, ibv_mr* mr, uint64_t wr_id, std::size_t msg_size) {
   ibv_sge sg{};
   sg.addr = reinterpret_cast<uintptr_t>(buffer);
-  sg.length = sizeof(Message);
+  sg.length = static_cast<uint32_t>(msg_size);
   sg.lkey = mr->lkey;
 
   ibv_send_wr wr{};
@@ -365,9 +365,11 @@ ibv_device* pick_device(const std::string& requested, ibv_device** list, int num
   return nullptr;
 }
 
-void fill_payload(Message& msg) {
-  for (size_t i = 0; i < msg.payload.size(); ++i) {
-    msg.payload[i] = static_cast<uint8_t>(i & 0xFF);
+void fill_payload(void* buffer, std::size_t msg_size) {
+  uint8_t* ptr = static_cast<uint8_t*>(buffer) + kHeaderSize;
+  std::size_t payload_size = msg_size - kHeaderSize;
+  for (size_t i = 0; i < payload_size; ++i) {
+    ptr[i] = static_cast<uint8_t>(i & 0xFF);
   }
 }
 
@@ -377,13 +379,15 @@ int run_server(const Options& opts) {
   ibv_pd* pd = nullptr;
   ibv_cq* cq = nullptr;
   ibv_qp* qp = nullptr;
-  Message* recv_msg = nullptr;
-  Message* send_msg = nullptr;
+  void* recv_buf = nullptr;
+  void* send_buf = nullptr;
   ibv_mr* recv_mr = nullptr;
   ibv_mr* send_mr = nullptr;
   int listen_fd = -1;
   int control_fd = -1;
   int ret = 1;
+  const std::size_t msg_size = opts.message_size;
+  const std::size_t buf_size = std::max(msg_size, static_cast<std::size_t>(4096));
 
   do {
     int num_devices = 0;
@@ -488,24 +492,25 @@ int run_server(const Options& opts) {
       break;
     }
 
-    recv_msg = static_cast<Message*>(allocate_page_aligned(kBufferBytes));
-    send_msg = static_cast<Message*>(allocate_page_aligned(kBufferBytes));
-    if (!recv_msg || !send_msg) {
+    recv_buf = allocate_page_aligned(buf_size);
+    send_buf = allocate_page_aligned(buf_size);
+    if (!recv_buf || !send_buf) {
       std::cerr << "Failed to allocate page-aligned buffers" << std::endl;
       break;
     }
-    std::memset(recv_msg, 0, sizeof(Message));
-    std::memset(send_msg, 0, sizeof(Message));
+    std::memset(recv_buf, 0, buf_size);
+    std::memset(send_buf, 0, buf_size);
 
     int mr_access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-    recv_mr = ibv_reg_mr(pd, recv_msg, kBufferBytes, mr_access);
-    send_mr = ibv_reg_mr(pd, send_msg, kBufferBytes, mr_access);
+    recv_mr = ibv_reg_mr(pd, recv_buf, buf_size, mr_access);
+    send_mr = ibv_reg_mr(pd, send_buf, buf_size, mr_access);
     if (!recv_mr || !send_mr) {
       std::cerr << "Failed to register memory" << std::endl;
       break;
     }
     std::cout << "Registered buffers: recv lkey=" << recv_mr->lkey
-              << " send lkey=" << send_mr->lkey << std::endl;
+              << " send lkey=" << send_mr->lkey
+              << " msg_size=" << msg_size << std::endl;
 
     ibv_gid remote_gid{};
     std::memcpy(remote_gid.raw, remote.gid, 16);
@@ -519,7 +524,7 @@ int run_server(const Options& opts) {
       break;
     }
 
-    if (!post_receive(qp, recv_msg, recv_mr, 1)) {
+    if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
       std::cerr << "Failed to post initial receive" << std::endl;
       break;
     }
@@ -543,8 +548,8 @@ int run_server(const Options& opts) {
       }
       if (wc.wr_id == 1 &&
           (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
-        std::memcpy(send_msg, recv_msg, sizeof(Message));
-        if (!post_send(qp, send_msg, send_mr, 2)) {
+        std::memcpy(send_buf, recv_buf, msg_size);
+        if (!post_send(qp, send_buf, send_mr, 2, msg_size)) {
           std::cerr << "Failed to post echo" << std::endl;
           success = false;
           break;
@@ -559,7 +564,7 @@ int run_server(const Options& opts) {
           success = false;
           break;
         }
-        if (!post_receive(qp, recv_msg, recv_mr, 1)) {
+        if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
           success = false;
           break;
         }
@@ -584,11 +589,11 @@ int run_server(const Options& opts) {
   if (recv_mr) {
     ibv_dereg_mr(recv_mr);
   }
-  if (send_msg) {
-    free(send_msg);
+  if (send_buf) {
+    free(send_buf);
   }
-  if (recv_msg) {
-    free(recv_msg);
+  if (recv_buf) {
+    free(recv_buf);
   }
   if (qp) {
     ibv_destroy_qp(qp);
@@ -614,12 +619,14 @@ int run_client(const Options& opts) {
   ibv_pd* pd = nullptr;
   ibv_cq* cq = nullptr;
   ibv_qp* qp = nullptr;
-  Message* recv_msg = nullptr;
-  Message* send_msg = nullptr;
+  void* recv_buf = nullptr;
+  void* send_buf = nullptr;
   ibv_mr* recv_mr = nullptr;
   ibv_mr* send_mr = nullptr;
   int control_fd = -1;
   int ret = 1;
+  const std::size_t msg_size = opts.message_size;
+  const std::size_t buf_size = std::max(msg_size, static_cast<std::size_t>(4096));
 
   do {
     int num_devices = 0;
@@ -719,24 +726,25 @@ int run_client(const Options& opts) {
       break;
     }
 
-    recv_msg = static_cast<Message*>(allocate_page_aligned(kBufferBytes));
-    send_msg = static_cast<Message*>(allocate_page_aligned(kBufferBytes));
-    if (!recv_msg || !send_msg) {
+    recv_buf = allocate_page_aligned(buf_size);
+    send_buf = allocate_page_aligned(buf_size);
+    if (!recv_buf || !send_buf) {
       std::cerr << "Failed to allocate page-aligned buffers" << std::endl;
       break;
     }
-    std::memset(recv_msg, 0, sizeof(Message));
-    std::memset(send_msg, 0, sizeof(Message));
+    std::memset(recv_buf, 0, buf_size);
+    std::memset(send_buf, 0, buf_size);
 
     int mr_access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-    recv_mr = ibv_reg_mr(pd, recv_msg, kBufferBytes, mr_access);
-    send_mr = ibv_reg_mr(pd, send_msg, kBufferBytes, mr_access);
+    recv_mr = ibv_reg_mr(pd, recv_buf, buf_size, mr_access);
+    send_mr = ibv_reg_mr(pd, send_buf, buf_size, mr_access);
     if (!recv_mr || !send_mr) {
       std::cerr << "Failed to register memory" << std::endl;
       break;
     }
     std::cout << "Registered buffers: recv lkey=" << recv_mr->lkey
-              << " send lkey=" << send_mr->lkey << std::endl;
+              << " send lkey=" << send_mr->lkey
+              << " msg_size=" << msg_size << std::endl;
 
     ibv_gid remote_gid{};
     std::memcpy(remote_gid.raw, remote.gid, 16);
@@ -750,7 +758,7 @@ int run_client(const Options& opts) {
       break;
     }
 
-    if (!post_receive(qp, recv_msg, recv_mr, 1)) {
+    if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
       std::cerr << "Failed to post initial receive" << std::endl;
       break;
     }
@@ -764,18 +772,30 @@ int run_client(const Options& opts) {
     }
     std::cout << "Synchronized with server, starting to send" << std::endl;
 
-    fill_payload(*send_msg);
+    fill_payload(send_buf, msg_size);
+    MessageHeader* send_hdr = static_cast<MessageHeader*>(send_buf);
+    MessageHeader* recv_hdr = static_cast<MessageHeader*>(recv_buf);
     uint64_t sequence = 0;
     bool success = true;
     std::vector<double> latencies;
     constexpr int warmup_iters = 100;
 
+    // Packet loss tracking
+    uint64_t expected_recv_seq = 1;  // Next expected sequence in received echo
+    uint64_t lost_packets = 0;       // Packets sent but no echo received (gaps in recv seq)
+    uint64_t out_of_order = 0;       // Packets received out of order
+    uint64_t duplicate_packets = 0;  // Duplicate sequence numbers received
+    std::vector<uint64_t> received_seqs;  // Track all received sequences for analysis
+
+    // Bandwidth measurement
+    uint64_t test_start_ns = wall_time_ns();
+
     for (int iter = 0; iter < opts.iterations; ++iter) {
       ++sequence;
-      send_msg->sequence = sequence;
-      send_msg->send_time_ns = wall_time_ns();
+      send_hdr->sequence = sequence;
+      send_hdr->send_time_ns = wall_time_ns();
 
-      if (!post_send(qp, send_msg, send_mr, 2)) {
+      if (!post_send(qp, send_buf, send_mr, 2, msg_size)) {
         std::cerr << "Failed to post send" << std::endl;
         success = false;
         break;
@@ -803,13 +823,47 @@ int run_client(const Options& opts) {
       }
 
       uint64_t now_ns = wall_time_ns();
-      double latency_us = static_cast<double>(now_ns - recv_msg->send_time_ns) / 1000.0;
+      double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+
+      // Check sequence number for packet loss detection
+      uint64_t recv_seq = recv_hdr->sequence;
+      received_seqs.push_back(recv_seq);
+
+      if (recv_seq == expected_recv_seq) {
+        // Normal case: received expected sequence
+        ++expected_recv_seq;
+      } else if (recv_seq > expected_recv_seq) {
+        // Gap detected: some packets were lost
+        uint64_t gap = recv_seq - expected_recv_seq;
+        lost_packets += gap;
+        std::cerr << "Packet loss detected: expected seq " << expected_recv_seq
+                  << ", got " << recv_seq << " (lost " << gap << " packets)" << std::endl;
+        expected_recv_seq = recv_seq + 1;
+      } else {
+        // recv_seq < expected_recv_seq: out of order or duplicate
+        // Check if we've seen this sequence before
+        bool is_duplicate = false;
+        for (size_t i = 0; i + 1 < received_seqs.size(); ++i) {
+          if (received_seqs[i] == recv_seq) {
+            is_duplicate = true;
+            break;
+          }
+        }
+        if (is_duplicate) {
+          ++duplicate_packets;
+          std::cerr << "Duplicate packet: seq " << recv_seq << std::endl;
+        } else {
+          ++out_of_order;
+          std::cerr << "Out-of-order packet: expected seq " << expected_recv_seq
+                    << ", got " << recv_seq << std::endl;
+        }
+      }
 
       if (iter >= warmup_iters) {
         latencies.push_back(latency_us);
       }
 
-      if (!post_receive(qp, recv_msg, recv_mr, 1)) {
+      if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
         success = false;
         break;
       }
@@ -837,6 +891,34 @@ int run_client(const Options& opts) {
         std::cout << "Avg:              " << std::fixed << std::setprecision(2) << avg_lat << " us" << std::endl;
         std::cout << "Max:              " << std::fixed << std::setprecision(2) << max_lat << " us" << std::endl;
       }
+
+      // Packet loss statistics
+      std::cout << "\n=== Packet Loss Statistics ===" << std::endl;
+      std::cout << "Total sent:       " << sequence << std::endl;
+      std::cout << "Total received:   " << received_seqs.size() << std::endl;
+      std::cout << "Lost packets:     " << lost_packets << std::endl;
+      std::cout << "Out-of-order:     " << out_of_order << std::endl;
+      std::cout << "Duplicates:       " << duplicate_packets << std::endl;
+      if (sequence > 0) {
+        double loss_rate = 100.0 * static_cast<double>(lost_packets) / static_cast<double>(sequence);
+        std::cout << "Loss rate:        " << std::fixed << std::setprecision(4) << loss_rate << " %" << std::endl;
+      }
+
+      // Bandwidth statistics
+      uint64_t test_end_ns = wall_time_ns();
+      double test_duration_s = static_cast<double>(test_end_ns - test_start_ns) / 1e9;
+      // Total bytes: each iteration sends 1 message and receives 1 echo (2 x msg_size)
+      uint64_t total_bytes = sequence * 2 * msg_size;
+      double bandwidth_gbps = static_cast<double>(total_bytes) / test_duration_s / 1e9;
+      double msg_rate = static_cast<double>(sequence) / test_duration_s;
+
+      std::cout << "\n=== Bandwidth Statistics ===" << std::endl;
+      std::cout << "Test duration:    " << std::fixed << std::setprecision(3) << test_duration_s << " s" << std::endl;
+      std::cout << "Message size:     " << msg_size << " bytes" << std::endl;
+      std::cout << "Total data:       " << std::fixed << std::setprecision(2)
+                << static_cast<double>(total_bytes) / 1e9 << " GB (send+recv)" << std::endl;
+      std::cout << "Bandwidth:        " << std::fixed << std::setprecision(4) << bandwidth_gbps << " GB/s" << std::endl;
+      std::cout << "Message rate:     " << std::fixed << std::setprecision(0) << msg_rate << " msg/s" << std::endl;
     }
   } while (false);
 
@@ -849,11 +931,11 @@ int run_client(const Options& opts) {
   if (recv_mr) {
     ibv_dereg_mr(recv_mr);
   }
-  if (send_msg) {
-    free(send_msg);
+  if (send_buf) {
+    free(send_buf);
   }
-  if (recv_msg) {
-    free(recv_msg);
+  if (recv_buf) {
+    free(recv_buf);
   }
   if (qp) {
     ibv_destroy_qp(qp);
@@ -877,10 +959,12 @@ void usage(const char* prog) {
   std::cerr << "Usage:" << std::endl;
   std::cerr << "  " << prog
             << " --server --listen <port> [--device <name>] [--ib-port <n>]"
-            << " [--gid-index <n>] [--iterations <n>]" << std::endl;
+            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>]" << std::endl;
   std::cerr << "  " << prog
             << " --client --connect <host:port> [--device <name>] [--ib-port <n>]"
-            << " [--gid-index <n>] [--iterations <n>]" << std::endl;
+            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>]" << std::endl;
+  std::cerr << "  Default message size: " << kDefaultMessageSize << " bytes, max: "
+            << kMaxMessageSize << " bytes" << std::endl;
 }
 
 bool parse_args(int argc, char** argv, Options& opts) {
@@ -916,6 +1000,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
       opts.connect_port = static_cast<uint16_t>(parse_port(target.substr(pos + 1)));
     } else if (arg == "--iterations" && i + 1 < argc) {
       opts.iterations = std::stoi(argv[++i]);
+    } else if (arg == "--message-size" && i + 1 < argc) {
+      opts.message_size = static_cast<std::size_t>(std::stoul(argv[++i]));
     } else {
       usage(argv[0]);
       return false;
@@ -929,6 +1015,13 @@ bool parse_args(int argc, char** argv, Options& opts) {
 
   if (opts.iterations <= 0) {
     throw std::runtime_error("Iterations must be positive");
+  }
+
+  if (opts.message_size < kHeaderSize) {
+    throw std::runtime_error("Message size must be at least " + std::to_string(kHeaderSize) + " bytes");
+  }
+  if (opts.message_size > kMaxMessageSize) {
+    throw std::runtime_error("Message size must be at most " + std::to_string(kMaxMessageSize) + " bytes");
   }
 
   if (opts.mode == Options::Mode::Server) {
