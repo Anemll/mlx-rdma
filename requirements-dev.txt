@@ -1,0 +1,18 @@
+# Development dependencies for MLX
+# Install with: uv pip install -r requirements-dev.txt
+
+# Build dependencies
+cmake>=3.25
+setuptools>=80
+nanobind==2.4.0
+
+# Test dependencies
+numpy
+torch
+tensorflow
+unittest-xml-reporting
+typing_extensions
+
+# Development tools
+pre-commit
+

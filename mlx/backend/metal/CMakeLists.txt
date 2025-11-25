@@ -121,13 +121,15 @@ if(NOT MLX_METAL_PATH)
   set(MLX_METAL_PATH ${CMAKE_CURRENT_BINARY_DIR}/kernels/)
 endif()
 
-if((MLX_METAL_VERSION GREATER_EQUAL 400) AND (MACOS_SDK_VERSION GREATER_EQUAL
-                                              26.2))
-  set(MLX_ENABLE_NAX TRUE)
-  target_compile_definitions(mlx PRIVATE MLX_ENABLE_NAX)
-else()
-  set(MLX_ENABLE_NAX FALSE)
-endif()
+# Temporarily disable NAX due to Metal 4.0 compiler issues
+# if((MLX_METAL_VERSION GREATER_EQUAL 400) AND (MACOS_SDK_VERSION GREATER_EQUAL
+#                                               26.2))
+#   set(MLX_ENABLE_NAX TRUE)
+#   target_compile_definitions(mlx PRIVATE MLX_ENABLE_NAX)
+# else()
+#   set(MLX_ENABLE_NAX FALSE)
+# endif()
+set(MLX_ENABLE_NAX FALSE)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/kernels)
 
