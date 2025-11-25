@@ -24,7 +24,10 @@ namespace {
 
 constexpr std::size_t kDefaultMessageSize = 1000;
 constexpr std::size_t kMaxMessageSize = 65536;  // 64KB max
-constexpr const char* kBuildVersion = "v0.0.26";
+constexpr const char* kBuildVersion = "v0.0.37";
+
+// Number of receive buffers to pre-post (sliding window)
+constexpr int kRecvWindowSize = 8;
 
 struct MessageHeader {
   uint64_t sequence;
@@ -40,6 +43,12 @@ struct WireQPInfo {
   uint8_t gid[16];
 };
 
+// Exchanged after QP info to synchronize test parameters
+struct WireTestParams {
+  uint32_t iterations;
+  uint32_t message_size;
+};
+
 struct Options {
   enum class Mode { Server, Client } mode;
   std::string device_name;
@@ -50,6 +59,7 @@ struct Options {
   uint16_t connect_port = 0;
   int iterations = 16;
   std::size_t message_size = kDefaultMessageSize;
+  int flood_outstanding = 0;  // 0 = disabled, >0 = flood mode with N outstanding
 };
 
 void* allocate_page_aligned(size_t num_bytes) {
@@ -187,6 +197,30 @@ bool exchange_qp_info(int fd, WireQPInfo& local, WireQPInfo& remote, bool is_ser
       return false;
     }
     if (!send_all(fd, &local, sizeof(local))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Exchange test parameters - server receives client's params and uses them
+bool exchange_test_params(int fd, WireTestParams& local, WireTestParams& remote, bool is_server) {
+  if (is_server) {
+    // Server receives client params first, then sends acknowledgment
+    if (!recv_all(fd, &remote, sizeof(remote))) {
+      return false;
+    }
+    // Server echoes back to confirm (using client's params)
+    if (!send_all(fd, &remote, sizeof(remote))) {
+      return false;
+    }
+  } else {
+    // Client sends its params
+    if (!send_all(fd, &local, sizeof(local))) {
+      return false;
+    }
+    // Client receives server's acknowledgment
+    if (!recv_all(fd, &remote, sizeof(remote))) {
       return false;
     }
   }
@@ -379,15 +413,15 @@ int run_server(const Options& opts) {
   ibv_pd* pd = nullptr;
   ibv_cq* cq = nullptr;
   ibv_qp* qp = nullptr;
-  void* recv_buf = nullptr;
+  std::vector<void*> recv_bufs(kRecvWindowSize, nullptr);
   void* send_buf = nullptr;
-  ibv_mr* recv_mr = nullptr;
+  std::vector<ibv_mr*> recv_mrs(kRecvWindowSize, nullptr);
   ibv_mr* send_mr = nullptr;
   int listen_fd = -1;
   int control_fd = -1;
   int ret = 1;
-  const std::size_t msg_size = opts.message_size;
-  const std::size_t buf_size = std::max(msg_size, static_cast<std::size_t>(4096));
+  std::size_t msg_size = opts.message_size;  // Will be overridden by client
+  int iterations = opts.iterations;           // Will be overridden by client
 
   do {
     int num_devices = 0;
@@ -421,7 +455,8 @@ int run_server(const Options& opts) {
       break;
     }
 
-    int cq_entries = std::max(1, std::min<int>(dev_attr.max_cqe, 16));
+    // Increase CQ size to handle window of receives + sends
+    int cq_entries = std::max(1, std::min<int>(dev_attr.max_cqe, kRecvWindowSize * 2 + 16));
     cq = ibv_create_cq(ctx, cq_entries, nullptr, nullptr, 0);
     if (!cq) {
       std::cerr << "Failed to create completion queue" << std::endl;
@@ -433,7 +468,8 @@ int run_server(const Options& opts) {
     init_attr.send_cq = cq;
     init_attr.recv_cq = cq;
     init_attr.srq = nullptr;
-    int max_wr = std::max(1, std::min<int>(dev_attr.max_qp_wr, 16));
+    // Increase QP capacity to handle sliding window
+    int max_wr = std::max(1, std::min<int>(dev_attr.max_qp_wr, kRecvWindowSize * 2 + 16));
     int max_sge = std::max(1, std::min<int>(dev_attr.max_sge, 1));
     init_attr.cap.max_send_wr = max_wr;
     init_attr.cap.max_recv_wr = max_wr;
@@ -492,25 +528,62 @@ int run_server(const Options& opts) {
       break;
     }
 
-    recv_buf = allocate_page_aligned(buf_size);
-    send_buf = allocate_page_aligned(buf_size);
-    if (!recv_buf || !send_buf) {
-      std::cerr << "Failed to allocate page-aligned buffers" << std::endl;
+    // Exchange test parameters - server uses client's values
+    WireTestParams local_params{};
+    local_params.iterations = static_cast<uint32_t>(opts.iterations);
+    local_params.message_size = static_cast<uint32_t>(opts.message_size);
+    WireTestParams remote_params{};
+    if (!exchange_test_params(control_fd, local_params, remote_params, true)) {
+      std::cerr << "Failed to exchange test parameters" << std::endl;
       break;
     }
-    std::memset(recv_buf, 0, buf_size);
+
+    // Use client's parameters
+    iterations = static_cast<int>(remote_params.iterations);
+    msg_size = static_cast<std::size_t>(remote_params.message_size);
+    std::cout << "Using client parameters: iterations=" << iterations
+              << " message_size=" << msg_size << std::endl;
+
+    const std::size_t buf_size = std::max(msg_size, static_cast<std::size_t>(4096));
+
+    // Allocate multiple receive buffers for sliding window
+    bool alloc_ok = true;
+    for (int i = 0; i < kRecvWindowSize; ++i) {
+      recv_bufs[i] = allocate_page_aligned(buf_size);
+      if (!recv_bufs[i]) {
+        std::cerr << "Failed to allocate page-aligned recv buffer " << i << std::endl;
+        alloc_ok = false;
+        break;
+      }
+      std::memset(recv_bufs[i], 0, buf_size);
+    }
+    if (!alloc_ok) break;
+
+    send_buf = allocate_page_aligned(buf_size);
+    if (!send_buf) {
+      std::cerr << "Failed to allocate page-aligned send buffer" << std::endl;
+      break;
+    }
     std::memset(send_buf, 0, buf_size);
 
     int mr_access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-    recv_mr = ibv_reg_mr(pd, recv_buf, buf_size, mr_access);
+    bool mr_ok = true;
+    for (int i = 0; i < kRecvWindowSize; ++i) {
+      recv_mrs[i] = ibv_reg_mr(pd, recv_bufs[i], buf_size, mr_access);
+      if (!recv_mrs[i]) {
+        std::cerr << "Failed to register recv memory " << i << std::endl;
+        mr_ok = false;
+        break;
+      }
+    }
+    if (!mr_ok) break;
+
     send_mr = ibv_reg_mr(pd, send_buf, buf_size, mr_access);
-    if (!recv_mr || !send_mr) {
-      std::cerr << "Failed to register memory" << std::endl;
+    if (!send_mr) {
+      std::cerr << "Failed to register send memory" << std::endl;
       break;
     }
-    std::cout << "Registered buffers: recv lkey=" << recv_mr->lkey
-              << " send lkey=" << send_mr->lkey
-              << " msg_size=" << msg_size << std::endl;
+    std::cout << "Registered " << kRecvWindowSize << " recv buffers + 1 send buffer, msg_size=" << msg_size << std::endl;
 
     ibv_gid remote_gid{};
     std::memcpy(remote_gid.raw, remote.gid, 16);
@@ -524,11 +597,20 @@ int run_server(const Options& opts) {
       break;
     }
 
-    if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
-      std::cerr << "Failed to post initial receive" << std::endl;
-      break;
+    // Pre-post all receive buffers (sliding window)
+    bool post_ok = true;
+    for (int i = 0; i < kRecvWindowSize; ++i) {
+      // Use wr_id to identify which buffer slot (1-based to avoid 0)
+      if (!post_receive(qp, recv_bufs[i], recv_mrs[i], static_cast<uint64_t>(i + 1), msg_size)) {
+        std::cerr << "Failed to post initial receive " << i << std::endl;
+        post_ok = false;
+        break;
+      }
     }
-    std::cout << "Server ready, QP in RTS state, waiting for messages..." << std::endl;
+    if (!post_ok) break;
+
+    std::cout << "Server ready, QP in RTS state, pre-posted " << kRecvWindowSize
+              << " receives, waiting for " << iterations << " messages..." << std::endl;
 
     // Synchronization barrier: let client know server is ready
     uint8_t ready = 1;
@@ -539,40 +621,73 @@ int run_server(const Options& opts) {
     std::cout << "Synchronized with client, ready to receive" << std::endl;
 
     int handled = 0;
+    int outstanding_sends = 0;
+    const int max_outstanding_sends = max_wr / 2;  // Leave room for receives
     bool success = true;
-    while (handled < opts.iterations) {
+
+    while (handled < iterations) {
       ibv_wc wc{};
       if (!poll_completion(cq, wc)) {
         success = false;
         break;
       }
-      if (wc.wr_id == 1 &&
+
+      // Handle receive completion
+      if (wc.wr_id >= 1 && wc.wr_id <= static_cast<uint64_t>(kRecvWindowSize) &&
           (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
-        std::memcpy(send_buf, recv_buf, msg_size);
-        if (!post_send(qp, send_buf, send_mr, 2, msg_size)) {
-          std::cerr << "Failed to post echo" << std::endl;
+        int buf_idx = static_cast<int>(wc.wr_id) - 1;
+
+        // Drain send completions if we're at the limit
+        while (outstanding_sends >= max_outstanding_sends) {
+          ibv_wc send_wc{};
+          int num = ibv_poll_cq(cq, 1, &send_wc);
+          if (num < 0) {
+            std::cerr << "ibv_poll_cq failed while draining sends" << std::endl;
+            success = false;
+            break;
+          }
+          if (num > 0 && send_wc.wr_id >= 100 && send_wc.opcode == IBV_WC_SEND) {
+            --outstanding_sends;
+          }
+        }
+        if (!success) break;
+
+        // Copy received data to send buffer and echo back
+        std::memcpy(send_buf, recv_bufs[buf_idx], msg_size);
+        if (!post_send(qp, send_buf, send_mr, 100 + handled, msg_size)) {
+          std::cerr << "Failed to post echo (outstanding=" << outstanding_sends << ")" << std::endl;
           success = false;
           break;
         }
-        ibv_wc send_wc{};
-        if (!poll_completion(cq, send_wc)) {
-          success = false;
-          break;
-        }
-        if (send_wc.wr_id != 2 || send_wc.opcode != IBV_WC_SEND) {
-          std::cerr << "Unexpected send completion" << std::endl;
-          success = false;
-          break;
-        }
-        if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
-          success = false;
-          break;
-        }
+        ++outstanding_sends;
         ++handled;
+
+        // Immediately re-post the receive buffer
+        if (!post_receive(qp, recv_bufs[buf_idx], recv_mrs[buf_idx], wc.wr_id, msg_size)) {
+          success = false;
+          break;
+        }
+      }
+      // Handle send completion
+      else if (wc.wr_id >= 100 && wc.opcode == IBV_WC_SEND) {
+        --outstanding_sends;
       }
     }
 
-    if (success && handled == opts.iterations) {
+    // Drain any outstanding send completions
+    while (outstanding_sends > 0 && success) {
+      ibv_wc wc{};
+      if (!poll_completion(cq, wc)) {
+        success = false;
+        break;
+      }
+      if (wc.wr_id >= 100 && wc.opcode == IBV_WC_SEND) {
+        --outstanding_sends;
+      }
+    }
+
+    if (success && handled == iterations) {
+      std::cout << "Server completed " << handled << " iterations successfully" << std::endl;
       ret = 0;
     }
   } while (false);
@@ -586,14 +701,18 @@ int run_server(const Options& opts) {
   if (send_mr) {
     ibv_dereg_mr(send_mr);
   }
-  if (recv_mr) {
-    ibv_dereg_mr(recv_mr);
+  for (int i = 0; i < kRecvWindowSize; ++i) {
+    if (recv_mrs[i]) {
+      ibv_dereg_mr(recv_mrs[i]);
+    }
   }
   if (send_buf) {
     free(send_buf);
   }
-  if (recv_buf) {
-    free(recv_buf);
+  for (int i = 0; i < kRecvWindowSize; ++i) {
+    if (recv_bufs[i]) {
+      free(recv_bufs[i]);
+    }
   }
   if (qp) {
     ibv_destroy_qp(qp);
@@ -660,19 +779,21 @@ int run_client(const Options& opts) {
       break;
     }
 
-    int cq_entries = std::max(1, std::min<int>(dev_attr.max_cqe, 16));
+    // Increase CQ size to handle more completions
+    int cq_entries = std::max(1, std::min<int>(dev_attr.max_cqe, 256));
     cq = ibv_create_cq(ctx, cq_entries, nullptr, nullptr, 0);
     if (!cq) {
       std::cerr << "Failed to create completion queue" << std::endl;
       break;
     }
+    std::cout << "Created CQ with " << cq_entries << " entries" << std::endl;
 
     ibv_qp_init_attr init_attr{};
     init_attr.qp_context = ctx;
     init_attr.send_cq = cq;
     init_attr.recv_cq = cq;
     init_attr.srq = nullptr;
-    int max_wr = std::max(1, std::min<int>(dev_attr.max_qp_wr, 16));
+    int max_wr = std::max(1, std::min<int>(dev_attr.max_qp_wr, 64));
     int max_sge = std::max(1, std::min<int>(dev_attr.max_sge, 1));
     init_attr.cap.max_send_wr = max_wr;
     init_attr.cap.max_recv_wr = max_wr;
@@ -725,6 +846,18 @@ int run_client(const Options& opts) {
       std::cerr << "Failed to exchange QP information" << std::endl;
       break;
     }
+
+    // Exchange test parameters - client sends, server will use them
+    WireTestParams local_params{};
+    local_params.iterations = static_cast<uint32_t>(opts.iterations);
+    local_params.message_size = static_cast<uint32_t>(opts.message_size);
+    WireTestParams remote_params{};
+    if (!exchange_test_params(control_fd, local_params, remote_params, false)) {
+      std::cerr << "Failed to exchange test parameters" << std::endl;
+      break;
+    }
+    std::cout << "Sent test parameters to server: iterations=" << opts.iterations
+              << " message_size=" << msg_size << std::endl;
 
     recv_buf = allocate_page_aligned(buf_size);
     send_buf = allocate_page_aligned(buf_size);
@@ -790,82 +923,215 @@ int run_client(const Options& opts) {
     // Bandwidth measurement
     uint64_t test_start_ns = wall_time_ns();
 
-    for (int iter = 0; iter < opts.iterations; ++iter) {
-      ++sequence;
-      send_hdr->sequence = sequence;
-      send_hdr->send_time_ns = wall_time_ns();
+    if (opts.flood_outstanding > 0) {
+      // Flood mode: send with limited outstanding to avoid saturating path
+      const int max_outstanding = opts.flood_outstanding;
+      std::cout << "FLOOD MODE: sending without waiting for echoes (max_outstanding="
+                << max_outstanding << ")" << std::endl;
+      int outstanding_sends = 0;
+      int progress_interval = opts.iterations / 10;
+      if (progress_interval < 1) progress_interval = 1;
 
-      if (!post_send(qp, send_buf, send_mr, 2, msg_size)) {
-        std::cerr << "Failed to post send" << std::endl;
-        success = false;
-        break;
-      }
-
-      bool have_send = false;
-      bool have_recv = false;
-      while (!have_send || !have_recv) {
-        ibv_wc wc{};
-        if (!poll_completion(cq, wc)) {
-          success = false;
-          have_send = have_recv = false;
-          break;
+      for (int iter = 0; iter < opts.iterations; ++iter) {
+        // Progress indicator
+        if (iter > 0 && iter % progress_interval == 0) {
+          std::cout << "  Sent " << iter << "/" << opts.iterations << " messages" << std::endl;
         }
-        if (wc.wr_id == 2 && wc.opcode == IBV_WC_SEND) {
-          have_send = true;
-        } else if (wc.wr_id == 1 &&
-                   (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
-          have_recv = true;
-        }
-      }
-      if (!have_send || !have_recv) {
-        success = false;
-        break;
-      }
 
-      uint64_t now_ns = wall_time_ns();
-      double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+        // Poll completions to free up send queue (non-blocking)
+        int poll_attempts = 0;
+        while (outstanding_sends >= max_outstanding) {
+          ibv_wc wc{};
+          int num = ibv_poll_cq(cq, 1, &wc);
+          if (num < 0) {
+            std::cerr << "ibv_poll_cq failed" << std::endl;
+            success = false;
+            break;
+          }
+          if (num > 0) {
+            if (wc.status != IBV_WC_SUCCESS) {
+              std::cerr << "Completion error: status=" << wc.status
+                        << " wr_id=" << wc.wr_id << " opcode=" << wc.opcode << std::endl;
+              success = false;
+              break;
+            }
+            if (wc.opcode == IBV_WC_SEND) {
+              --outstanding_sends;
+            } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+              // Got a recv completion - track RTT and stats
+              uint64_t now_ns = wall_time_ns();
+              uint64_t recv_seq = recv_hdr->sequence;
+              double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
 
-      // Check sequence number for packet loss detection
-      uint64_t recv_seq = recv_hdr->sequence;
-      received_seqs.push_back(recv_seq);
+              received_seqs.push_back(recv_seq);
+              if (received_seqs.size() > static_cast<size_t>(warmup_iters)) {
+                latencies.push_back(latency_us);
+              }
 
-      if (recv_seq == expected_recv_seq) {
-        // Normal case: received expected sequence
-        ++expected_recv_seq;
-      } else if (recv_seq > expected_recv_seq) {
-        // Gap detected: some packets were lost
-        uint64_t gap = recv_seq - expected_recv_seq;
-        lost_packets += gap;
-        std::cerr << "Packet loss detected: expected seq " << expected_recv_seq
-                  << ", got " << recv_seq << " (lost " << gap << " packets)" << std::endl;
-        expected_recv_seq = recv_seq + 1;
-      } else {
-        // recv_seq < expected_recv_seq: out of order or duplicate
-        // Check if we've seen this sequence before
-        bool is_duplicate = false;
-        for (size_t i = 0; i + 1 < received_seqs.size(); ++i) {
-          if (received_seqs[i] == recv_seq) {
-            is_duplicate = true;
+              // Repost receive buffer
+              if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
+                std::cerr << "Failed to repost receive in flood mode" << std::endl;
+              }
+            }
+          }
+          ++poll_attempts;
+          if (poll_attempts > 10000000) {
+            std::cerr << "TIMEOUT waiting for send completion, outstanding="
+                      << outstanding_sends << std::endl;
+            success = false;
             break;
           }
         }
-        if (is_duplicate) {
-          ++duplicate_packets;
-          std::cerr << "Duplicate packet: seq " << recv_seq << std::endl;
-        } else {
-          ++out_of_order;
-          std::cerr << "Out-of-order packet: expected seq " << expected_recv_seq
-                    << ", got " << recv_seq << std::endl;
+        if (!success) break;
+
+        ++sequence;
+        send_hdr->sequence = sequence;
+        send_hdr->send_time_ns = wall_time_ns();
+
+        if (!post_send(qp, send_buf, send_mr, 2, msg_size)) {
+          std::cerr << "Failed to post send at iter " << iter << std::endl;
+          success = false;
+          break;
+        }
+        ++outstanding_sends;
+      }
+
+      std::cout << "Draining " << outstanding_sends << " outstanding sends..." << std::endl;
+      // Drain remaining send completions
+      while (outstanding_sends > 0 && success) {
+        ibv_wc wc{};
+        int num = ibv_poll_cq(cq, 1, &wc);
+        if (num < 0) {
+          std::cerr << "ibv_poll_cq failed during drain" << std::endl;
+          success = false;
+          break;
+        }
+        if (num > 0) {
+          if (wc.opcode == IBV_WC_SEND) {
+            --outstanding_sends;
+          } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+            // Track recv during drain too
+            uint64_t now_ns = wall_time_ns();
+            double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+            received_seqs.push_back(recv_hdr->sequence);
+            if (received_seqs.size() > static_cast<size_t>(warmup_iters)) {
+              latencies.push_back(latency_us);
+            }
+            if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
+              std::cerr << "Failed to repost receive during drain" << std::endl;
+            }
+          }
         }
       }
 
-      if (iter >= warmup_iters) {
-        latencies.push_back(latency_us);
+      // Wait for remaining echoes from server (with timeout)
+      std::cout << "Waiting for remaining echoes (received " << received_seqs.size()
+                << "/" << sequence << ")..." << std::endl;
+      int drain_timeout = 0;
+      while (received_seqs.size() < sequence && drain_timeout < 10000000 && success) {
+        ibv_wc wc{};
+        int num = ibv_poll_cq(cq, 1, &wc);
+        if (num < 0) {
+          success = false;
+          break;
+        }
+        if (num > 0 && (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
+          uint64_t now_ns = wall_time_ns();
+          double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+          received_seqs.push_back(recv_hdr->sequence);
+          if (received_seqs.size() > static_cast<size_t>(warmup_iters)) {
+            latencies.push_back(latency_us);
+          }
+          if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
+            std::cerr << "Failed to repost receive" << std::endl;
+          }
+          drain_timeout = 0;  // Reset timeout on progress
+        } else {
+          ++drain_timeout;
+        }
       }
+      std::cout << "Flood complete: sent " << sequence << ", received "
+                << received_seqs.size() << " echoes" << std::endl;
 
-      if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
-        success = false;
-        break;
+    } else {
+      // Normal ping-pong mode: wait for echo before sending next
+      for (int iter = 0; iter < opts.iterations; ++iter) {
+        ++sequence;
+        send_hdr->sequence = sequence;
+        send_hdr->send_time_ns = wall_time_ns();
+
+        if (!post_send(qp, send_buf, send_mr, 2, msg_size)) {
+          std::cerr << "Failed to post send" << std::endl;
+          success = false;
+          break;
+        }
+
+        bool have_send = false;
+        bool have_recv = false;
+        while (!have_send || !have_recv) {
+          ibv_wc wc{};
+          if (!poll_completion(cq, wc)) {
+            success = false;
+            have_send = have_recv = false;
+            break;
+          }
+          if (wc.wr_id == 2 && wc.opcode == IBV_WC_SEND) {
+            have_send = true;
+          } else if (wc.wr_id == 1 &&
+                     (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
+            have_recv = true;
+          }
+        }
+        if (!have_send || !have_recv) {
+          success = false;
+          break;
+        }
+
+        uint64_t now_ns = wall_time_ns();
+        double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+
+        // Check sequence number for packet loss detection
+        uint64_t recv_seq = recv_hdr->sequence;
+        received_seqs.push_back(recv_seq);
+
+        if (recv_seq == expected_recv_seq) {
+          // Normal case: received expected sequence
+          ++expected_recv_seq;
+        } else if (recv_seq > expected_recv_seq) {
+          // Gap detected: some packets were lost
+          uint64_t gap = recv_seq - expected_recv_seq;
+          lost_packets += gap;
+          std::cerr << "Packet loss detected: expected seq " << expected_recv_seq
+                    << ", got " << recv_seq << " (lost " << gap << " packets)" << std::endl;
+          expected_recv_seq = recv_seq + 1;
+        } else {
+          // recv_seq < expected_recv_seq: out of order or duplicate
+          // Check if we've seen this sequence before
+          bool is_duplicate = false;
+          for (size_t i = 0; i + 1 < received_seqs.size(); ++i) {
+            if (received_seqs[i] == recv_seq) {
+              is_duplicate = true;
+              break;
+            }
+          }
+          if (is_duplicate) {
+            ++duplicate_packets;
+            std::cerr << "Duplicate packet: seq " << recv_seq << std::endl;
+          } else {
+            ++out_of_order;
+            std::cerr << "Out-of-order packet: expected seq " << expected_recv_seq
+                      << ", got " << recv_seq << std::endl;
+          }
+        }
+
+        if (iter >= warmup_iters) {
+          latencies.push_back(latency_us);
+        }
+
+        if (!post_receive(qp, recv_buf, recv_mr, 1, msg_size)) {
+          success = false;
+          break;
+        }
       }
     }
 
@@ -959,16 +1225,19 @@ void usage(const char* prog) {
   std::cerr << "Usage:" << std::endl;
   std::cerr << "  " << prog
             << " --server --listen <port> [--device <name>] [--ib-port <n>]"
-            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>]" << std::endl;
+            << " [--gid-index <n>]" << std::endl;
   std::cerr << "  " << prog
             << " --client --connect <host:port> [--device <name>] [--ib-port <n>]"
-            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>]" << std::endl;
+            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>] [--flood <n>]" << std::endl;
   std::cerr << "  Default message size: " << kDefaultMessageSize << " bytes, max: "
             << kMaxMessageSize << " bytes" << std::endl;
+  std::cerr << "  --flood <n>: Flood mode with n packets in flight (default 2 if no value)" << std::endl;
+  std::cerr << "  Note: Server uses client's iteration count and message size" << std::endl;
 }
 
 bool parse_args(int argc, char** argv, Options& opts) {
   if (argc < 2) {
+    std::cout << "ibv_roundtrip " << kBuildVersion << std::endl;
     usage(argv[0]);
     return false;
   }
@@ -1002,6 +1271,14 @@ bool parse_args(int argc, char** argv, Options& opts) {
       opts.iterations = std::stoi(argv[++i]);
     } else if (arg == "--message-size" && i + 1 < argc) {
       opts.message_size = static_cast<std::size_t>(std::stoul(argv[++i]));
+    } else if (arg == "--flood") {
+      // Check if next arg is a number
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        opts.flood_outstanding = std::stoi(argv[++i]);
+        if (opts.flood_outstanding < 1) opts.flood_outstanding = 2;
+      } else {
+        opts.flood_outstanding = 2;  // Default to 2 if no value given
+      }
     } else {
       usage(argv[0]);
       return false;
