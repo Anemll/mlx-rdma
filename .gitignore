@@ -91,3 +91,5 @@ check_rdma_peer_interface
 SCP_GUIDE.md
 check_rdma_peer_interface_simple
 tcp_roundtrip
+ibv_roundtrip
+.claude/CLAUDE.local.md
