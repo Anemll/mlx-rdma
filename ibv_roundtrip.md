@@ -2,15 +2,16 @@
 
 A latency and bandwidth measurement tool for RDMA over Thunderbolt on macOS. Performs ping-pong round-trip tests and flood bandwidth tests using UC (Unreliable Connection) transport.
 
-**Current Version:** v0.0.37
+**Current Version:** v0.0.54
 
 ## Constraints & Supported Features
 - **Transport:** Apple's Thunderbolt RDMA adapters only expose UD/UC transports. The tool uses **UC queue pairs** just like `mlx/distributed/jaccl/jaccl.cpp`. RC is not available and attempts to create RC QPs return `EOPNOTSUPP`.
-- **GID usage:** LIDs are always `0x0001`, so global routing is required. Always run with `--gid-index 1` (Thunderbolt RoCE entry). Index 0 is `::` and causes RTR failures.
+- **GID usage:** LIDs are always `0x0001`, so global routing is required. The tool auto-detects the correct GID index by searching for IPv4-mapped addresses (`::ffff:x.x.x.x`). Use `--gid-index N` to override if needed.
 - **Queue pair limits:** `ibv_query_device` reports tiny capacities (≈11 QPs / CQEs). Creation will fail if other jobs hold QPs; stop MLX or reboot to free them.
 - **Page-aligned buffers:** The hardware expects page-aligned, >=4 KB buffers. Use the provided helper that mirrors Jaccl's `page_aligned_alloc()` and register both send/recv buffers with full RW access.
 - **Memory registration flags:** Must use `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE` to match jaccl configuration, even for SEND/RECV operations.
 - **Synchronization barrier:** Both client and server synchronize via TCP after QP transitions to ensure both are ready before RDMA traffic begins. This prevents packet loss during initialization.
+- **Server auto-restart:** After each test, the server fully restarts the RDMA device (closes ctx/pd, re-gets device list) to work around Apple driver resource leaks. A 2-second idle timeout handles packet loss gracefully.
 
 ## Common Pitfalls (Fixed in v0.0.23)
 - **"Operation not supported" during `ibv_create_qp`:** Happens if you request RC/UD or exceed device caps for max WR/SQE. Keep WR counts ≤ `ibv_query_device().max_qp_wr` and use UC.
@@ -62,9 +63,10 @@ c++ -std=c++17 -O2 -Wall -Wextra -o ibv_roundtrip ibv_roundtrip.cpp -lrdma
 | `--gid-index <n>` | GID index (use 1 for Thunderbolt RoCE) |
 | `--iterations <n>` | Number of messages to send (client only) |
 | `--message-size <bytes>` | Message size in bytes (client only, default: 1000, max: 65536) |
-| `--flood [n]` | Flood mode with n packets in flight (client only, default: 2) |
+| `--flood [n]` | Flood mode with n packets in flight per QP (client only, default: max WR-2) |
+| `--qp <n>` | Number of queue pairs to use (1-8, default: 1) |
 
-**Note:** Server automatically uses client's `--iterations` and `--message-size` values (synchronized via TCP control channel).
+**Note:** Server automatically uses client's `--iterations`, `--message-size`, and `--qp` values (synchronized via TCP control channel).
 
 ### Expected Output (Ping-Pong Mode)
 ```
@@ -131,6 +133,7 @@ The tool performs a warmup of 100 iterations, then measures round-trip latency f
 - **Ping-pong mode:** ~0.55 GB/s, ~69K msg/s
 - **Flood mode (2 outstanding):** ~1.5 GB/s, ~190K msg/s
 - **Flood mode (4 outstanding):** ~1.7 GB/s, ~215K msg/s
+- **Multi-QP (3 QPs, flood):** ~2.5 GB/s, ~310K msg/s
 
 **Comparison with Other Transports:**
 - Dedicated RDMA NICs (RoCE/InfiniBand): 1-5 μs RTT, 10+ GB/s
@@ -174,6 +177,16 @@ The tool performs a warmup of 100 iterations, then measures round-trip latency f
 - macOS only (uses Apple's rdma library)
 
 ## Version History
+- **v0.0.54:** Full device list cleanup on restart, increased restart delay to 500ms for better hardware reset
+- **v0.0.53:** Added 2-second server idle timeout to prevent hanging on packet loss, enables auto-restart
+- **v0.0.52:** Server auto-restarts RDMA device after each test (closes/reopens ctx, pd) to handle Apple driver quirks
+- **v0.0.48-v0.0.51:** Added QP state transitions (RTS→ERROR→RESET) before destruction for clean cleanup
+- **v0.0.47:** Fixed drain loop to poll all CQs together preventing hangs in multi-QP mode
+- **v0.0.46:** Increased max QPs from 4 to 8
+- **v0.0.45:** Fixed flood mode: `--flood N` now means N packets per QP (total = N × num_qps)
+- **v0.0.44:** Fixed multi-QP flood mode by polling all CQs for completions
+- **v0.0.43:** Added GID auto-detection for IPv4-mapped addresses across different devices
+- **v0.0.41:** Added multi-QP support (`--qp N`) to increase bandwidth by using multiple parallel queue pairs
 - **v0.0.37:** Added `--flood [n]` to specify max outstanding packets
 - **v0.0.36:** Flood mode now tracks RTT for received echoes
 - **v0.0.35:** Increased CQ (256) and QP capacity (64), fixed flood mode send completion issues
