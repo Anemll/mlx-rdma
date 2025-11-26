@@ -8,17 +8,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -54,7 +59,7 @@ public:
 
 constexpr std::size_t kDefaultMessageSize = 1000;
 constexpr std::size_t kMaxMessageSize = 65536;  // 64KB max
-constexpr const char* kBuildVersion = "v0.0.57";
+constexpr const char* kBuildVersion = "v0.0.61";
 constexpr int kMaxQPs = 8;  // Maximum number of queue pairs (hardware supports ~11)
 constexpr int kMaxGIDIndex = 8;  // Max GID indices to search
 
@@ -94,6 +99,9 @@ struct Options {
   std::size_t message_size = kDefaultMessageSize;
   int flood_outstanding = -1;  // -1 = disabled (ping-pong), 0 = unlimited, >0 = limited outstanding
   int num_qps = 1;             // Number of queue pairs (1-4)
+  bool shared_cq = false;      // Use single shared CQ for all QPs
+  bool threaded = false;       // Use separate thread per QP
+  bool save_results = false;   // Save results to results.json
 };
 
 // Per-QP resources for multi-QP support
@@ -116,6 +124,15 @@ struct QPContext {
   int outstanding_sends = 0;
   uint64_t sequence = 0;
   int handled = 0;
+};
+
+// Per-thread statistics for threaded mode
+struct ThreadStats {
+  uint64_t sent = 0;
+  uint64_t received = 0;
+  std::vector<double> latencies;
+  std::vector<uint64_t> received_seqs;
+  bool success = true;
 };
 
 void* allocate_page_aligned(size_t num_bytes) {
@@ -348,7 +365,7 @@ bool modify_qp_to_rtr(ibv_qp* qp, const WireQPInfo& remote, uint8_t port, bool u
                       uint8_t gid_index) {
   ibv_qp_attr attr{};
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = IBV_MTU_1024;  // Match jaccl.cpp
+  attr.path_mtu = IBV_MTU_4096;  // Larger MTU to avoid fragmentation
   attr.dest_qp_num = remote.qp_num;
   attr.rq_psn = remote.psn;
   attr.ah_attr.is_global = use_gid;
@@ -359,7 +376,7 @@ bool modify_qp_to_rtr(ibv_qp* qp, const WireQPInfo& remote, uint8_t port, bool u
 
   std::cout << "RTR: remote_qp=" << remote.qp_num << " remote_lid=" << remote.lid
             << " psn=" << remote.psn << " use_gid=" << use_gid
-            << " mtu=1024" << std::endl;
+            << " mtu=4096" << std::endl;
 
   if (use_gid) {
     ibv_gid remote_gid{};
@@ -563,6 +580,91 @@ void cleanup_qp_context(QPContext& qpc, ibv_pd* pd) {
   }
 
   qpc = QPContext{};  // Reset to defaults
+}
+
+// Save test results to JSON file (append mode)
+void save_results_json(const std::string& filename, int num_qps, int iterations,
+                       std::size_t message_size, int flood_outstanding,
+                       bool threaded, bool shared_cq,
+                       double min_lat, double avg_lat, double max_lat,
+                       double bandwidth_gbps, double msg_rate,
+                       uint64_t total_sent, uint64_t total_received,
+                       double loss_rate, double duration_s) {
+  // Read existing file content if it exists
+  std::string existing_content;
+  {
+    std::ifstream infile(filename);
+    if (infile.good()) {
+      std::stringstream buffer;
+      buffer << infile.rdbuf();
+      existing_content = buffer.str();
+    }
+  }
+
+  // Check if file has existing JSON array
+  bool has_existing = !existing_content.empty() && existing_content.find('[') != std::string::npos;
+
+  std::ofstream outfile(filename, std::ios::trunc);
+  if (!outfile.is_open()) {
+    std::cerr << "Warning: Could not open " << filename << " for writing" << std::endl;
+    return;
+  }
+
+  // Get current timestamp
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  char timestamp[64];
+  std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t_now));
+
+  // Build JSON entry
+  std::ostringstream json_entry;
+  json_entry << "  {\n";
+  json_entry << "    \"timestamp\": \"" << timestamp << "\",\n";
+  json_entry << "    \"version\": \"" << kBuildVersion << "\",\n";
+  json_entry << "    \"num_qps\": " << num_qps << ",\n";
+  json_entry << "    \"iterations\": " << iterations << ",\n";
+  json_entry << "    \"message_size\": " << message_size << ",\n";
+  json_entry << "    \"flood_outstanding\": " << flood_outstanding << ",\n";
+  json_entry << "    \"threaded\": " << (threaded ? "true" : "false") << ",\n";
+  json_entry << "    \"shared_cq\": " << (shared_cq ? "true" : "false") << ",\n";
+  json_entry << "    \"latency_us\": {\n";
+  json_entry << "      \"min\": " << std::fixed << std::setprecision(2) << min_lat << ",\n";
+  json_entry << "      \"avg\": " << std::fixed << std::setprecision(2) << avg_lat << ",\n";
+  json_entry << "      \"max\": " << std::fixed << std::setprecision(2) << max_lat << "\n";
+  json_entry << "    },\n";
+  json_entry << "    \"bandwidth_gbps\": " << std::fixed << std::setprecision(4) << bandwidth_gbps << ",\n";
+  json_entry << "    \"message_rate\": " << std::fixed << std::setprecision(0) << msg_rate << ",\n";
+  json_entry << "    \"packets\": {\n";
+  json_entry << "      \"sent\": " << total_sent << ",\n";
+  json_entry << "      \"received\": " << total_received << ",\n";
+  json_entry << "      \"lost\": " << (total_sent - total_received) << ",\n";
+  json_entry << "      \"loss_rate_pct\": " << std::fixed << std::setprecision(4) << loss_rate << "\n";
+  json_entry << "    },\n";
+  json_entry << "    \"duration_s\": " << std::fixed << std::setprecision(3) << duration_s << "\n";
+  json_entry << "  }";
+
+  if (has_existing) {
+    // Find the last ']' and insert before it
+    size_t last_bracket = existing_content.rfind(']');
+    if (last_bracket != std::string::npos) {
+      // Find if there's content before the bracket (need comma)
+      size_t last_brace = existing_content.rfind('}');
+      bool need_comma = (last_brace != std::string::npos && last_brace < last_bracket);
+
+      outfile << existing_content.substr(0, last_bracket);
+      if (need_comma) outfile << ",\n";
+      outfile << json_entry.str() << "\n]\n";
+    } else {
+      // Malformed, start fresh
+      outfile << "[\n" << json_entry.str() << "\n]\n";
+    }
+  } else {
+    // Start new array
+    outfile << "[\n" << json_entry.str() << "\n]\n";
+  }
+
+  outfile.close();
+  std::cout << "Results saved to " << filename << std::endl;
 }
 
 int run_server(const Options& opts) {
@@ -1202,7 +1304,9 @@ int run_client(const Options& opts) {
               << " message_size=" << msg_size << " num_qps=" << num_qps << std::endl;
 
     // Create CQs, QPs, and buffers for each QP
-    const int cq_entries = std::max(1, std::min<int>(dev_attr.max_cqe, 256));
+    // For shared CQ mode, use larger CQ to handle all QPs
+    const int per_qp_cq_entries = std::max(1, std::min<int>(dev_attr.max_cqe, 256));
+    const int cq_entries = opts.shared_cq ? std::min<int>(dev_attr.max_cqe, per_qp_cq_entries * num_qps) : per_qp_cq_entries;
     const int max_wr = std::max(1, std::min<int>(dev_attr.max_qp_wr, 64));
     const int max_sge = std::max(1, std::min<int>(dev_attr.max_sge, 1));
     const int mr_access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
@@ -1211,16 +1315,32 @@ int run_client(const Options& opts) {
     std::random_device rd;
     bool setup_ok = true;
 
+    // Create shared CQ if requested
+    ibv_cq* shared_cq = nullptr;
+    if (opts.shared_cq) {
+      shared_cq = ibv_create_cq(ctx, cq_entries, nullptr, nullptr, 0);
+      if (!shared_cq) {
+        std::cerr << "Failed to create shared CQ" << std::endl;
+        setup_ok = false;
+      } else {
+        std::cout << "Using SHARED CQ for all " << num_qps << " QPs (entries=" << cq_entries << ")" << std::endl;
+      }
+    }
+
     for (int q = 0; q < num_qps && setup_ok; ++q) {
       QPContext& qpc = qps[q];
       qpc.psn = rd() & 0xFFFFFF;
 
-      // Create CQ
-      qpc.cq = ibv_create_cq(ctx, cq_entries, nullptr, nullptr, 0);
-      if (!qpc.cq) {
-        std::cerr << "Failed to create CQ for QP " << q << std::endl;
-        setup_ok = false;
-        break;
+      // Create CQ (or use shared)
+      if (opts.shared_cq) {
+        qpc.cq = shared_cq;  // All QPs share same CQ
+      } else {
+        qpc.cq = ibv_create_cq(ctx, cq_entries, nullptr, nullptr, 0);
+        if (!qpc.cq) {
+          std::cerr << "Failed to create CQ for QP " << q << std::endl;
+          setup_ok = false;
+          break;
+        }
       }
 
       // Create QP
@@ -1375,8 +1495,152 @@ int run_client(const Options& opts) {
 
     uint64_t test_start_ns = wall_time_ns();
 
-    if (opts.flood_outstanding >= 0) {
-      // Flood mode with multiple QPs - distribute sends round-robin
+    if (opts.flood_outstanding >= 0 && opts.threaded && num_qps > 1) {
+      // THREADED flood mode - one thread per QP
+      const int per_qp_outstanding = (opts.flood_outstanding == 0) ? (max_wr - 2) :
+                                      std::max(1, opts.flood_outstanding);
+      const int max_outstanding_per_qp = std::min(per_qp_outstanding, max_wr - 2);
+      const int iters_per_qp = opts.iterations / num_qps;
+      const int extra_iters = opts.iterations % num_qps;  // Distribute remainder to first threads
+
+      std::cout << "THREADED FLOOD MODE: " << num_qps << " threads/QPs, "
+                << iters_per_qp << " iters/thread, " << max_outstanding_per_qp
+                << " outstanding/QP" << std::endl;
+
+      std::vector<ThreadStats> thread_stats(num_qps);
+      std::atomic<int> ready_count{0};
+      std::atomic<bool> start_flag{false};
+
+      // Thread worker function
+      auto worker = [&](int qp_idx, int my_iters) {
+        QPContext& qpc = qps[qp_idx];
+        ThreadStats& stats = thread_stats[qp_idx];
+        const int warmup = std::min(warmup_iters / num_qps, my_iters / 10);
+
+        // Signal ready and wait for start
+        ready_count.fetch_add(1);
+        while (!start_flag.load()) {
+          // Spin wait
+        }
+
+        int outstanding = 0;
+
+        for (int iter = 0; iter < my_iters && stats.success; ++iter) {
+          // Poll CQ to make room if needed
+          while (outstanding >= max_outstanding_per_qp) {
+            ibv_wc wc{};
+            int num = ibv_poll_cq(qpc.cq, 1, &wc);
+            if (num < 0) {
+              stats.success = false;
+              break;
+            }
+            if (num > 0) {
+              if (wc.status != IBV_WC_SUCCESS) {
+                stats.success = false;
+                break;
+              }
+              if (wc.opcode == IBV_WC_SEND) {
+                --outstanding;
+              } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                uint64_t now_ns = wall_time_ns();
+                MessageHeader* recv_hdr = static_cast<MessageHeader*>(qpc.recv_buf);
+                double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+                stats.received_seqs.push_back(recv_hdr->sequence);
+                ++stats.received;
+                if (stats.received > static_cast<uint64_t>(warmup)) {
+                  stats.latencies.push_back(latency_us);
+                }
+                // Repost receive
+                uint64_t wr_id = (static_cast<uint64_t>(qp_idx) << 16) | 1;
+                post_receive(qpc.qp, qpc.recv_buf, qpc.recv_mr, wr_id, msg_size);
+              }
+            }
+          }
+          if (!stats.success) break;
+
+          // Send
+          ++qpc.sequence;
+          ++stats.sent;
+          MessageHeader* send_hdr = static_cast<MessageHeader*>(qpc.send_buf);
+          send_hdr->sequence = (static_cast<uint64_t>(qp_idx) << 48) | qpc.sequence;  // Encode QP in sequence
+          send_hdr->send_time_ns = wall_time_ns();
+
+          uint64_t send_wr_id = (static_cast<uint64_t>(qp_idx) << 16) | 2;
+          if (!post_send(qpc.qp, qpc.send_buf, qpc.send_mr, send_wr_id, msg_size)) {
+            stats.success = false;
+            break;
+          }
+          ++outstanding;
+        }
+
+        // Drain outstanding
+        int drain_timeout = 0;
+        while ((outstanding > 0 || stats.received < stats.sent) && drain_timeout < 10000000 && stats.success) {
+          ibv_wc wc{};
+          int num = ibv_poll_cq(qpc.cq, 1, &wc);
+          if (num < 0) {
+            stats.success = false;
+            break;
+          }
+          if (num > 0) {
+            drain_timeout = 0;
+            if (wc.opcode == IBV_WC_SEND) {
+              --outstanding;
+            } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+              uint64_t now_ns = wall_time_ns();
+              MessageHeader* recv_hdr = static_cast<MessageHeader*>(qpc.recv_buf);
+              double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+              stats.received_seqs.push_back(recv_hdr->sequence);
+              ++stats.received;
+              if (stats.received > static_cast<uint64_t>(warmup)) {
+                stats.latencies.push_back(latency_us);
+              }
+              uint64_t wr_id = (static_cast<uint64_t>(qp_idx) << 16) | 1;
+              post_receive(qpc.qp, qpc.recv_buf, qpc.recv_mr, wr_id, msg_size);
+            }
+          } else {
+            ++drain_timeout;
+          }
+        }
+      };
+
+      // Launch threads
+      std::vector<std::thread> threads;
+      for (int q = 0; q < num_qps; ++q) {
+        int my_iters = iters_per_qp + (q < extra_iters ? 1 : 0);
+        threads.emplace_back(worker, q, my_iters);
+      }
+
+      // Wait for all threads ready, then start
+      while (ready_count.load() < num_qps) {
+        // Spin wait
+      }
+      test_start_ns = wall_time_ns();  // Reset start time
+      start_flag.store(true);
+
+      // Wait for all threads to complete
+      for (auto& t : threads) {
+        t.join();
+      }
+
+      // Aggregate statistics
+      for (int q = 0; q < num_qps; ++q) {
+        total_sent += thread_stats[q].sent;
+        total_received += thread_stats[q].received;
+        latencies.insert(latencies.end(),
+                        thread_stats[q].latencies.begin(),
+                        thread_stats[q].latencies.end());
+        received_seqs.insert(received_seqs.end(),
+                            thread_stats[q].received_seqs.begin(),
+                            thread_stats[q].received_seqs.end());
+        if (!thread_stats[q].success) success = false;
+      }
+
+      std::cout << "Threaded flood complete: sent " << total_sent << ", received "
+                << total_received << " echoes" << std::endl;
+
+    } else if (opts.flood_outstanding >= 0) {
+      // Single-threaded flood mode with multiple QPs - distribute sends round-robin
       // --flood N means N packets PER QP, so total = N * num_qps
       const int per_qp_outstanding = (opts.flood_outstanding == 0) ? (max_wr - 2) :
                                       std::max(1, opts.flood_outstanding);
@@ -1401,26 +1665,31 @@ int run_client(const Options& opts) {
         int q = iter % num_qps;
         QPContext& qpc = qps[q];
 
-        // Poll ALL CQs to free up send queues and receive echoes
+        // Poll CQ(s) to free up send queues and receive echoes
         int poll_attempts = 0;
         while (total_outstanding >= max_outstanding_total || qpc.outstanding_sends >= max_outstanding_per_qp) {
-          bool found_any = false;
-          for (int pq = 0; pq < num_qps; ++pq) {
-            QPContext& poll_qpc = qps[pq];
-            ibv_wc wc{};
-            int num = ibv_poll_cq(poll_qpc.cq, 1, &wc);
+          ibv_wc wc{};
+          int num;
+
+          if (opts.shared_cq) {
+            // Single poll on shared CQ - use wr_id to identify QP
+            num = ibv_poll_cq(shared_cq, 1, &wc);
             if (num < 0) {
-              std::cerr << "ibv_poll_cq failed on QP " << pq << std::endl;
+              std::cerr << "ibv_poll_cq failed on shared CQ" << std::endl;
               success = false;
               break;
             }
             if (num > 0) {
-              found_any = true;
               if (wc.status != IBV_WC_SUCCESS) {
-                std::cerr << "Completion error on QP " << pq << ": status=" << wc.status << std::endl;
+                std::cerr << "Completion error on shared CQ: status=" << wc.status << std::endl;
                 success = false;
                 break;
               }
+              // Extract QP index from wr_id (high 16 bits)
+              int pq = static_cast<int>(wc.wr_id >> 16);
+              if (pq < 0 || pq >= num_qps) pq = 0;  // Safety check
+              QPContext& poll_qpc = qps[pq];
+
               if (wc.opcode == IBV_WC_SEND) {
                 --poll_qpc.outstanding_sends;
                 --total_outstanding;
@@ -1436,6 +1705,41 @@ int run_client(const Options& opts) {
                 uint64_t wr_id = (static_cast<uint64_t>(pq) << 16) | 1;
                 if (!post_receive(poll_qpc.qp, poll_qpc.recv_buf, poll_qpc.recv_mr, wr_id, msg_size)) {
                   std::cerr << "Failed to repost receive on QP " << pq << std::endl;
+                }
+              }
+            }
+          } else {
+            // Poll each QP's CQ in round-robin
+            for (int pq = 0; pq < num_qps; ++pq) {
+              QPContext& poll_qpc = qps[pq];
+              num = ibv_poll_cq(poll_qpc.cq, 1, &wc);
+              if (num < 0) {
+                std::cerr << "ibv_poll_cq failed on QP " << pq << std::endl;
+                success = false;
+                break;
+              }
+              if (num > 0) {
+                if (wc.status != IBV_WC_SUCCESS) {
+                  std::cerr << "Completion error on QP " << pq << ": status=" << wc.status << std::endl;
+                  success = false;
+                  break;
+                }
+                if (wc.opcode == IBV_WC_SEND) {
+                  --poll_qpc.outstanding_sends;
+                  --total_outstanding;
+                } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                  uint64_t now_ns = wall_time_ns();
+                  MessageHeader* recv_hdr = static_cast<MessageHeader*>(poll_qpc.recv_buf);
+                  double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+                  received_seqs.push_back(recv_hdr->sequence);
+                  ++total_received;
+                  if (received_seqs.size() > static_cast<size_t>(warmup_iters)) {
+                    latencies.push_back(latency_us);
+                  }
+                  uint64_t wr_id = (static_cast<uint64_t>(pq) << 16) | 1;
+                  if (!post_receive(poll_qpc.qp, poll_qpc.recv_buf, poll_qpc.recv_mr, wr_id, msg_size)) {
+                    std::cerr << "Failed to repost receive on QP " << pq << std::endl;
+                  }
                 }
               }
             }
@@ -1469,39 +1773,75 @@ int run_client(const Options& opts) {
         ++total_outstanding;
       }
 
-      // Drain all outstanding sends and wait for echoes - poll ALL CQs together
+      // Drain all outstanding sends and wait for echoes
       std::cout << "Draining outstanding (total=" << total_outstanding << ")..." << std::endl;
       int drain_timeout = 0;
       while ((total_outstanding > 0 || total_received < total_sent) && drain_timeout < 10000000 && success) {
         bool found_any = false;
-        for (int q = 0; q < num_qps && success; ++q) {
-          QPContext& qpc = qps[q];
-          ibv_wc wc{};
-          int num = ibv_poll_cq(qpc.cq, 1, &wc);
+        ibv_wc wc{};
+        int num;
+
+        if (opts.shared_cq) {
+          // Single poll on shared CQ
+          num = ibv_poll_cq(shared_cq, 1, &wc);
           if (num < 0) {
             success = false;
             break;
           }
           if (num > 0) {
             found_any = true;
+            int pq = static_cast<int>(wc.wr_id >> 16);
+            if (pq < 0 || pq >= num_qps) pq = 0;
+            QPContext& poll_qpc = qps[pq];
+
             if (wc.status != IBV_WC_SUCCESS) {
-              std::cerr << "Drain: completion error on QP " << q << ": status=" << wc.status << std::endl;
-              // Don't fail, just continue draining
+              std::cerr << "Drain: completion error: status=" << wc.status << std::endl;
             }
             if (wc.opcode == IBV_WC_SEND) {
-              --qpc.outstanding_sends;
+              --poll_qpc.outstanding_sends;
               --total_outstanding;
             } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
               uint64_t now_ns = wall_time_ns();
-              MessageHeader* recv_hdr = static_cast<MessageHeader*>(qpc.recv_buf);
+              MessageHeader* recv_hdr = static_cast<MessageHeader*>(poll_qpc.recv_buf);
               double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
               received_seqs.push_back(recv_hdr->sequence);
               ++total_received;
               if (received_seqs.size() > static_cast<size_t>(warmup_iters)) {
                 latencies.push_back(latency_us);
               }
-              uint64_t wr_id = (static_cast<uint64_t>(q) << 16) | 1;
-              post_receive(qpc.qp, qpc.recv_buf, qpc.recv_mr, wr_id, msg_size);
+              uint64_t wr_id = (static_cast<uint64_t>(pq) << 16) | 1;
+              post_receive(poll_qpc.qp, poll_qpc.recv_buf, poll_qpc.recv_mr, wr_id, msg_size);
+            }
+          }
+        } else {
+          // Poll each QP's CQ
+          for (int q = 0; q < num_qps && success; ++q) {
+            QPContext& qpc = qps[q];
+            num = ibv_poll_cq(qpc.cq, 1, &wc);
+            if (num < 0) {
+              success = false;
+              break;
+            }
+            if (num > 0) {
+              found_any = true;
+              if (wc.status != IBV_WC_SUCCESS) {
+                std::cerr << "Drain: completion error on QP " << q << ": status=" << wc.status << std::endl;
+              }
+              if (wc.opcode == IBV_WC_SEND) {
+                --qpc.outstanding_sends;
+                --total_outstanding;
+              } else if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                uint64_t now_ns = wall_time_ns();
+                MessageHeader* recv_hdr = static_cast<MessageHeader*>(qpc.recv_buf);
+                double latency_us = static_cast<double>(now_ns - recv_hdr->send_time_ns) / 1000.0;
+                received_seqs.push_back(recv_hdr->sequence);
+                ++total_received;
+                if (received_seqs.size() > static_cast<size_t>(warmup_iters)) {
+                  latencies.push_back(latency_us);
+                }
+                uint64_t wr_id = (static_cast<uint64_t>(q) << 16) | 1;
+                post_receive(qpc.qp, qpc.recv_buf, qpc.recv_mr, wr_id, msg_size);
+              }
             }
           }
         }
@@ -1628,11 +1968,34 @@ int run_client(const Options& opts) {
                 << static_cast<double>(total_bytes) / 1e9 << " GB (send+recv)" << std::endl;
       std::cout << "Bandwidth:        " << std::fixed << std::setprecision(4) << bandwidth_gbps << " GB/s" << std::endl;
       std::cout << "Message rate:     " << std::fixed << std::setprecision(0) << msg_rate << " msg/s" << std::endl;
+
+      // Save results to JSON if requested
+      if (opts.save_results) {
+        double min_lat = 0.0, avg_lat = 0.0, max_lat = 0.0;
+        if (!latencies.empty()) {
+          min_lat = *std::min_element(latencies.begin(), latencies.end());
+          max_lat = *std::max_element(latencies.begin(), latencies.end());
+          double sum = 0.0;
+          for (double lat : latencies) sum += lat;
+          avg_lat = sum / latencies.size();
+        }
+        double loss_rate = total_sent > 0 ? 100.0 * static_cast<double>(total_sent - total_received) / static_cast<double>(total_sent) : 0.0;
+        save_results_json("results.json", num_qps, opts.iterations, msg_size,
+                          opts.flood_outstanding, opts.threaded, opts.shared_cq,
+                          min_lat, avg_lat, max_lat, bandwidth_gbps, msg_rate,
+                          total_sent, total_received, loss_rate, test_duration_s);
+      }
     }
   } while (false);
 
   // Cleanup - order matters for Apple driver!
   // 1. First cleanup all QPs (destroys QPs, CQs, deregisters MRs, frees buffers)
+  //    For shared CQ mode, clear CQ pointers from all but first QP to avoid double-free
+  if (opts.shared_cq && qps.size() > 1) {
+    for (size_t i = 1; i < qps.size(); ++i) {
+      qps[i].cq = nullptr;  // Don't destroy shared CQ multiple times
+    }
+  }
   for (auto& qpc : qps) cleanup_qp_context(qpc, pd);
   qps.clear();
 
@@ -1662,11 +2025,14 @@ void usage(const char* prog) {
             << " [--gid-index <n>]" << std::endl;
   std::cerr << "  " << prog
             << " --client --connect <host:port> [--device <name>] [--ib-port <n>]"
-            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>] [--flood <n>] [--qp <n>]" << std::endl;
+            << " [--gid-index <n>] [--iterations <n>] [--message-size <bytes>] [--flood <n>] [--qp <n>] [--shared-cq] [--threaded] [--save]" << std::endl;
   std::cerr << "  Default message size: " << kDefaultMessageSize << " bytes, max: "
             << kMaxMessageSize << " bytes" << std::endl;
   std::cerr << "  --flood [n]: Flood mode (0 or omit = unlimited, n = limit outstanding)" << std::endl;
   std::cerr << "  --qp <n>: Number of queue pairs (1-" << kMaxQPs << ", default: 1)" << std::endl;
+  std::cerr << "  --shared-cq: Use single shared CQ for all QPs (reduces polling overhead)" << std::endl;
+  std::cerr << "  --threaded: Use separate thread per QP (requires --flood and --qp > 1)" << std::endl;
+  std::cerr << "  --save: Save results to results.json (append mode)" << std::endl;
   std::cerr << "  Note: Server uses client's iteration count, message size, and QP count" << std::endl;
 }
 
@@ -1716,6 +2082,12 @@ bool parse_args(int argc, char** argv, Options& opts) {
       }
     } else if (arg == "--qp" && i + 1 < argc) {
       opts.num_qps = std::stoi(argv[++i]);
+    } else if (arg == "--shared-cq") {
+      opts.shared_cq = true;
+    } else if (arg == "--threaded") {
+      opts.threaded = true;
+    } else if (arg == "--save") {
+      opts.save_results = true;
     } else {
       usage(argv[0]);
       return false;
@@ -1740,6 +2112,22 @@ bool parse_args(int argc, char** argv, Options& opts) {
 
   if (opts.num_qps < 1 || opts.num_qps > kMaxQPs) {
     throw std::runtime_error("Number of QPs must be between 1 and " + std::to_string(kMaxQPs));
+  }
+
+  // Warn if --threaded is used without proper options
+  if (opts.threaded) {
+    if (opts.flood_outstanding < 0) {
+      std::cerr << "Warning: --threaded requires --flood, enabling flood mode" << std::endl;
+      opts.flood_outstanding = 0;
+    }
+    if (opts.num_qps < 2) {
+      std::cerr << "Warning: --threaded requires --qp > 1, ignoring --threaded" << std::endl;
+      opts.threaded = false;
+    }
+    if (opts.shared_cq) {
+      std::cerr << "Warning: --threaded is incompatible with --shared-cq, ignoring --shared-cq" << std::endl;
+      opts.shared_cq = false;
+    }
   }
 
   if (opts.mode == Options::Mode::Server) {
