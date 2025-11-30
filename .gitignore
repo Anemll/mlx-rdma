@@ -93,3 +93,5 @@ check_rdma_peer_interface_simple
 tcp_roundtrip
 ibv_roundtrip
 .claude/CLAUDE.local.md
+QP.PLAN.md
+sync_hosts_debug.sh

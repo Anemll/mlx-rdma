@@ -1,0 +1,551 @@
+[
+  {
+    "timestamp": "2025-11-26 09:19:51",
+    "version": "v0.0.61",
+    "num_qps": 3,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 13.00,
+      "avg": 43.96,
+      "max": 240.00
+    },
+    "bandwidth_gbps": 5.1415,
+    "message_rate": 627626,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.593
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:05",
+    "version": "v0.0.61",
+    "num_qps": 1,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": false,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 7.00,
+      "avg": 12.36,
+      "max": 280.00
+    },
+    "bandwidth_gbps": 2.7710,
+    "message_rate": 338252,
+    "packets": {
+      "sent": 1000000,
+      "received": 999994,
+      "lost": 6,
+      "loss_rate_pct": 0.0006
+    },
+    "duration_s": 2.956
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:18",
+    "version": "v0.0.61",
+    "num_qps": 2,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 13.00,
+      "avg": 32.30,
+      "max": 188.00
+    },
+    "bandwidth_gbps": 4.7470,
+    "message_rate": 579472,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.726
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:22",
+    "version": "v0.0.61",
+    "num_qps": 3,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 16.00,
+      "avg": 44.37,
+      "max": 222.00
+    },
+    "bandwidth_gbps": 5.1228,
+    "message_rate": 625337,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.599
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:27",
+    "version": "v0.0.61",
+    "num_qps": 4,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 15.00,
+      "avg": 52.29,
+      "max": 488.00
+    },
+    "bandwidth_gbps": 5.7673,
+    "message_rate": 704016,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.420
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:33",
+    "version": "v0.0.61",
+    "num_qps": 5,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 13.00,
+      "avg": 63.06,
+      "max": 366.00
+    },
+    "bandwidth_gbps": 5.9473,
+    "message_rate": 725993,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.377
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:38",
+    "version": "v0.0.61",
+    "num_qps": 6,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 15.00,
+      "avg": 73.61,
+      "max": 772.00
+    },
+    "bandwidth_gbps": 6.0966,
+    "message_rate": 744210,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.344
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:43",
+    "version": "v0.0.61",
+    "num_qps": 6,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 13.00,
+      "avg": 74.60,
+      "max": 308.00
+    },
+    "bandwidth_gbps": 6.0009,
+    "message_rate": 732528,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.365
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:47",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 10.00,
+      "avg": 84.73,
+      "max": 2136.00
+    },
+    "bandwidth_gbps": 6.1370,
+    "message_rate": 749149,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.335
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:20:52",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 10.00,
+      "avg": 85.74,
+      "max": 1735.00
+    },
+    "bandwidth_gbps": 6.0664,
+    "message_rate": 740533,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.350
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:21:04",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 7,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 15.00,
+      "avg": 72.08,
+      "max": 740.00
+    },
+    "bandwidth_gbps": 5.9618,
+    "message_rate": 727764,
+    "packets": {
+      "sent": 1000000,
+      "received": 999958,
+      "lost": 42,
+      "loss_rate_pct": 0.0042
+    },
+    "duration_s": 1.374
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:21:08",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 7,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 17.00,
+      "avg": 80.79,
+      "max": 1033.00
+    },
+    "bandwidth_gbps": 5.6905,
+    "message_rate": 694645,
+    "packets": {
+      "sent": 1000000,
+      "received": 999958,
+      "lost": 42,
+      "loss_rate_pct": 0.0042
+    },
+    "duration_s": 1.440
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:38:14",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 7,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 14.00,
+      "avg": 88.15,
+      "max": 1231.00
+    },
+    "bandwidth_gbps": 5.6956,
+    "message_rate": 695266,
+    "packets": {
+      "sent": 1000000,
+      "received": 999972,
+      "lost": 28,
+      "loss_rate_pct": 0.0028
+    },
+    "duration_s": 1.438
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:38:40",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 7,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 15.00,
+      "avg": 89.26,
+      "max": 1312.00
+    },
+    "bandwidth_gbps": 5.8560,
+    "message_rate": 714846,
+    "packets": {
+      "sent": 1000000,
+      "received": 999965,
+      "lost": 35,
+      "loss_rate_pct": 0.0035
+    },
+    "duration_s": 1.399
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:39:15",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 14.00,
+      "avg": 86.11,
+      "max": 554.00
+    },
+    "bandwidth_gbps": 6.0665,
+    "message_rate": 740543,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.350
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:39:18",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 11.00,
+      "avg": 87.15,
+      "max": 463.00
+    },
+    "bandwidth_gbps": 5.9945,
+    "message_rate": 731756,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.367
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:39:20",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 11.00,
+      "avg": 87.70,
+      "max": 821.00
+    },
+    "bandwidth_gbps": 5.9525,
+    "message_rate": 726629,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.376
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:39:23",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 11.00,
+      "avg": 86.01,
+      "max": 290.00
+    },
+    "bandwidth_gbps": 6.0701,
+    "message_rate": 740981,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.350
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:41:03",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 10.00,
+      "avg": 74.71,
+      "max": 637.00
+    },
+    "bandwidth_gbps": 5.9958,
+    "message_rate": 731910,
+    "packets": {
+      "sent": 1000000,
+      "received": 999993,
+      "lost": 7,
+      "loss_rate_pct": 0.0007
+    },
+    "duration_s": 1.366
+  }
+,
+  {
+    "timestamp": "2025-11-26 09:50:49",
+    "version": "v0.0.61",
+    "num_qps": 1,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": -1,
+    "threaded": false,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 6.00,
+      "avg": 10.57,
+      "max": 78.00
+    },
+    "bandwidth_gbps": 0.6978,
+    "message_rate": 85176,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 11.740
+  }
+,
+  {
+    "timestamp": "2025-11-29 17:44:52",
+    "version": "v0.0.61",
+    "num_qps": 1,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": -1,
+    "threaded": false,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 6.00,
+      "avg": 13.24,
+      "max": 95.00
+    },
+    "bandwidth_gbps": 0.5796,
+    "message_rate": 70752,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 14.134
+  }
+,
+  {
+    "timestamp": "2025-11-29 17:45:15",
+    "version": "v0.0.61",
+    "num_qps": 7,
+    "iterations": 1000000,
+    "message_size": 4096,
+    "flood_outstanding": 1,
+    "threaded": true,
+    "shared_cq": false,
+    "latency_us": {
+      "min": 10.00,
+      "avg": 85.53,
+      "max": 857.00
+    },
+    "bandwidth_gbps": 6.0790,
+    "message_rate": 742068,
+    "packets": {
+      "sent": 1000000,
+      "received": 1000000,
+      "lost": 0,
+      "loss_rate_pct": 0.0000
+    },
+    "duration_s": 1.348
+  }
+]
