@@ -14,7 +14,7 @@ export HOME="$FAKE_HOME"
 # Only rerun CMake configure when the build directory is missing a cache.
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
   cmake -B "$BUILD_DIR" -S "$ROOT" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DMLX_BUILD_BENCHMARKS=ON \
     -DCMAKE_CXX_FLAGS="-fmodules-cache-path=$CACHE_DIR"
 else
